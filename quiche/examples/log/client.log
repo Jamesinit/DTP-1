@@ -1,0 +1,7 @@
+peer_addr = 127.0.0.1:4433
+test begin!
+
+BlockID  bct  BlockSize  Priority  Deadline
+connection closed
+recv,sent,lost,rtt(ms),cwnd,total_bytes,complete_bytes,good_bytes,total_time(us)
+0,1,0,333.000000,13500,55,0,0,5001282

@@ -37,7 +37,8 @@ static struct argp_option options[] = {
     {"quic", 'q', 0, 0, "Use QUIC instead of DTP"},
     {0}};
 
-struct arguments {
+struct arguments
+{
   FILE *log_file;
   FILE *out_file;
   char *server_ip;
@@ -49,9 +50,11 @@ static bool QUIC_ENABLE = false;
 
 static struct arguments args;
 
-static error_t parse_opt(int key, char *arg, struct argp_state *state) {
+static error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
   struct arguments *arguments = state->input;
-  switch (key) {
+  switch (key)
+  {
   case 'l':
     arguments->log_file = fopen(arg, "w+");
     break;
@@ -71,12 +74,15 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
     QUIC_ENABLE = true;
     break;
   case ARGP_KEY_ARG:
-    switch (state->arg_num) {
-    case 0: {
+    switch (state->arg_num)
+    {
+    case 0:
+    {
       arguments->server_ip = arg;
       break;
     }
-    case 1: {
+    case 1:
+    {
       arguments->server_port = arg;
       break;
     }
@@ -115,7 +121,8 @@ uint64_t total_udp_bytes = 0;
 uint64_t started_at = 0;
 uint64_t ended_at = 0;
 
-struct conn_io {
+struct conn_io
+{
   ev_timer timer;
   ev_timer pacer;
 
@@ -129,18 +136,22 @@ struct conn_io {
 
 static void debug_log(const char *line, void *argp) { log_error("%s", line); }
 
-void set_tos(int ai_family, int sock, int tos) {
+void set_tos(int ai_family, int sock, int tos)
+{
   if (!DIFFSERV_ENABLE)
     return;
 
-  switch (ai_family) {
+  switch (ai_family)
+  {
   case AF_INET:
-    if (setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0) {
+    if (setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) < 0)
+    {
       log_error("failed to set TOS %s", strerror(errno));
     }
     break;
   case AF_INET6:
-    if (setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos)) < 0) {
+    if (setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos)) < 0)
+    {
       log_error("failed to set TOS %s", strerror(errno));
     }
     break;
@@ -152,21 +163,25 @@ void set_tos(int ai_family, int sock, int tos) {
 
 /***** callbacks *****/
 
-static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
+static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io)
+{
   static uint8_t out[MAX_DATAGRAM_SIZE];
 
   quiche_send_info send_info;
 
-  while (1) {
+  while (1)
+  {
     ssize_t written =
         quiche_conn_send(conn_io->conn, out, sizeof(out), &send_info);
 
-    if (written == QUICHE_ERR_DONE) {
+    if (written == QUICHE_ERR_DONE)
+    {
       log_debug("done writing");
       break;
     }
 
-    if (written < 0) {
+    if (written < 0)
+    {
       log_error("failed to create packet: %zd", written);
       return;
     }
@@ -175,7 +190,8 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
     ssize_t sent = sendto(conn_io->sock, out, written, 0,
                           (struct sockaddr *)&send_info.to, send_info.to_len);
 
-    if (sent != written) {
+    if (sent != written)
+    {
       log_error("failed to send %s", strerror(errno));
       return;
     }
@@ -184,7 +200,8 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
   }
 
   double t = quiche_conn_timeout_as_nanos(conn_io->conn) / 1e9f;
-  if (t != 0) {
+  if (t != 0)
+  {
     conn_io->timer.repeat = t;
     ev_timer_again(loop, &conn_io->timer);
   }
@@ -199,20 +216,23 @@ static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
   ev_timer_again(loop, &conn_io->pacer);
 }
 
-static void pacer_cb(struct ev_loop *loop, ev_timer *pacer, int revents) {
+static void pacer_cb(struct ev_loop *loop, ev_timer *pacer, int revents)
+{
   // log_debug("flush egress pace triggered");
   struct conn_io *conn_io = pacer->data;
   flush_egress(loop, conn_io);
 }
 
-static void recv_cb(EV_P_ ev_io *w, int revents) {
+static void recv_cb(EV_P_ ev_io *w, int revents)
+{
   // static bool req_sent = false;
 
   struct conn_io *conn_io = w->data;
 
   static uint8_t buf[MAX_BLOCK_SIZE];
 
-  while (1) {
+  while (1)
+  {
     struct sockaddr_storage peer_addr;
     socklen_t peer_addr_len = sizeof(peer_addr);
     memset(&peer_addr, 0, peer_addr_len);
@@ -220,8 +240,10 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
     ssize_t read = recvfrom(conn_io->sock, buf, sizeof(buf), 0,
                             (struct sockaddr *)&peer_addr, &peer_addr_len);
 
-    if (read < 0) {
-      if ((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
+    if (read < 0)
+    {
+      if ((errno == EWOULDBLOCK) || (errno == EAGAIN))
+      {
         log_debug("recv would block");
         break;
       }
@@ -240,7 +262,8 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
 
     ssize_t done = quiche_conn_recv(conn_io->conn, buf, read, &recv_info);
 
-    if (done < 0) {
+    if (done < 0)
+    {
       log_error("failed to process packet %ld", done);
       continue;
     }
@@ -250,7 +273,8 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
 
   log_debug("done reading");
 
-  if (quiche_conn_is_closed(conn_io->conn)) {
+  if (quiche_conn_is_closed(conn_io->conn))
+  {
     log_info("connection closed");
 
     quiche_stats stats;
@@ -286,24 +310,28 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
   //   req_sent = true;
   // }
 
-  if (quiche_conn_is_established(conn_io->conn)) {
+  if (quiche_conn_is_established(conn_io->conn))
+  {
     uint64_t s = 0;
 
     quiche_stream_iter *readable = quiche_conn_readable(conn_io->conn);
 
-    while (quiche_stream_iter_next(readable, &s)) {
+    while (quiche_stream_iter_next(readable, &s))
+    {
       log_debug("stream %" PRIu64 " is readable", s);
 
       bool fin = false;
       ssize_t recv_len =
           quiche_conn_stream_recv(conn_io->conn, s, buf, sizeof(buf), &fin);
-      if (recv_len < 0) {
+      if (recv_len < 0)
+      {
         log_debug("recv_len %ld", recv_len);
         break;
       }
       total_bytes += recv_len;
 
-      if (fin) {
+      if (fin)
+      {
         ended_at = get_current_usec();
         uint64_t bct = quiche_conn_bct(conn_io->conn, s);
         quiche_block block_info;
@@ -321,7 +349,8 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
   flush_egress(loop, conn_io);
 }
 
-static void timeout_cb(EV_P_ ev_timer *w, int revents) {
+static void timeout_cb(EV_P_ ev_timer *w, int revents)
+{
   struct conn_io *conn_io = w->data;
   quiche_conn_on_timeout(conn_io->conn);
 
@@ -329,7 +358,8 @@ static void timeout_cb(EV_P_ ev_timer *w, int revents) {
 
   flush_egress(loop, conn_io);
 
-  if (quiche_conn_is_closed(conn_io->conn)) {
+  if (quiche_conn_is_closed(conn_io->conn))
+  {
     quiche_stats stats;
 
     quiche_conn_stats(conn_io->conn, &stats);
@@ -345,7 +375,8 @@ static void timeout_cb(EV_P_ ev_timer *w, int revents) {
   }
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
   args.out_file = stdout;
   args.log_file = stdout;
   argp_parse(&argp, argc, argv, 0, 0, &args);
@@ -359,25 +390,29 @@ int main(int argc, char *argv[]) {
 
   struct addrinfo *server;
   int err = getaddrinfo(args.server_ip, args.server_port, &hints, &server);
-  if (err != 0) {
+  if (err != 0)
+  {
     log_error("getaddrinfo: %s", gai_strerror(err));
     return -1;
   }
 
   int sock =
       socket(server->ai_family, server->ai_socktype, server->ai_protocol);
-  if (sock < 0) {
+  if (sock < 0)
+  {
     log_error("create socket");
     return -1;
   }
 
-  if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0) {
+  if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0)
+  {
     log_error("fcntl");
     return -1;
   }
 
   quiche_config *config = quiche_config_new(0xbabababa);
-  if (config == NULL) {
+  if (config == NULL)
+  {
     log_error("failed to create config");
     return -1;
   }
@@ -397,19 +432,22 @@ int main(int argc, char *argv[]) {
   quiche_config_set_initial_max_streams_uni(config, 40000);
   quiche_config_set_disable_active_migration(config, true);
 
-  if (getenv("SSLKEYLOGFILE")) {
+  if (getenv("SSLKEYLOGFILE"))
+  {
     quiche_config_log_keys(config);
   }
 
   uint8_t scid[LOCAL_CONN_ID_LEN];
   int rng = open("/dev/urandom", O_RDONLY);
-  if (rng < 0) {
+  if (rng < 0)
+  {
     log_error("failed to open /dev/urandom %s", strerror(errno));
     return -1;
   }
 
   ssize_t rand_len = read(rng, &scid, sizeof(scid));
-  if (rand_len < 0) {
+  if (rand_len < 0)
+  {
     log_error("failed to create connection ID %s", strerror(errno));
     return -1;
   }
@@ -418,7 +456,8 @@ int main(int argc, char *argv[]) {
       quiche_connect(args.server_ip, (const uint8_t *)scid, sizeof(scid),
                      server->ai_addr, server->ai_addrlen, config);
 
-  if (conn == NULL) {
+  if (conn == NULL)
+  {
     log_error("failed to create connection");
     return -1;
   }
@@ -427,7 +466,8 @@ int main(int argc, char *argv[]) {
   started_at = get_current_usec();
 
   struct conn_io *conn_io = malloc(sizeof(*conn_io));
-  if (conn_io == NULL) {
+  if (conn_io == NULL)
+  {
     log_error("failed to allocate connection IO");
     return -1;
   }

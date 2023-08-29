@@ -24,175 +24,295 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#include <dtp_config.h>
+#include <errno.h>
+#include <ev.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <netdb.h>
+#include <quiche.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <unistd.h>
-
-#include <fcntl.h>
-#include <errno.h>
-
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netdb.h>
-
-#include <ev.h>
-
-#include <quiche.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #define LOCAL_CONN_ID_LEN 16
 
 #define MAX_DATAGRAM_SIZE 1350
 
-struct conn_io {
+#define MAX_BLOCK_SIZE 1000000 // 1Mbytes
+
+int cfgs_len = 0;
+uint64_t total_bytes = 0;
+uint64_t good_bytes = 0;
+uint64_t complete_bytes = 0;
+uint64_t start_timestamp = 0;
+uint64_t end_timestamp = 0;
+
+FILE *CLIENT_LOG = NULL;
+FILE *CLIENT_CSV = NULL;
+// wzx add. template add ./log prefix
+const char *CLIENT_LOG_FILENAME = "./log/client.log";
+const char *CLIENT_CSV_FILENAME = "./log/client.csv";
+#define WRITE_TO_LOG(...)                                            \
+    {                                                                \
+        if (!CLIENT_LOG)                                             \
+        {                                                            \
+            perror("Write to client log fails: file is not opened"); \
+        }                                                            \
+        fprintf(CLIENT_LOG, __VA_ARGS__);                            \
+    }
+
+#define WRITE_TO_CSV(...)                                            \
+    {                                                                \
+        if (!CLIENT_CSV)                                             \
+        {                                                            \
+            perror("Write to client csv fails: file is not opened"); \
+        }                                                            \
+        fprintf(CLIENT_CSV, __VA_ARGS__);                            \
+    }
+
+struct conn_io
+{
     ev_timer timer;
+    ev_timer pace_timer;
 
     int sock;
-
+    // wzx add
     struct sockaddr_storage local_addr;
     socklen_t local_addr_len;
 
     quiche_conn *conn;
+
+    uint64_t t_last;
+    ssize_t can_send;
+    bool done_writing;
 };
 
-static void debug_log(const char *line, void *argp) {
-    fprintf(stderr, "%s\n", line);
-}
+// static void debug_log(const char *line, void *argp) {
+//     fprintf(stderr, "%s\n", line);
+// }
 
-static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io) {
+static void flush_egress(struct ev_loop *loop, struct conn_io *conn_io)
+{
     static uint8_t out[MAX_DATAGRAM_SIZE];
-
+    uint64_t rate = quiche_bbr_get_pacing_rate(conn_io->conn); // bits/s
+    // uint64_t rate = 48*1024*1024; //48Mbits/s
+    if (conn_io->done_writing)
+    {
+        conn_io->can_send = 1350;
+        conn_io->t_last = getCurrentUsec();
+        conn_io->done_writing = false;
+    }
+    // wzx add: send info
     quiche_send_info send_info;
-
-    while (1) {
+    while (1)
+    {
+        uint64_t t_now = getCurrentUsec();
+        conn_io->can_send += rate * (t_now - conn_io->t_last) /
+                             8000000; //(bits/8)/s * s = bytes
+        // fprintf(stderr, "%ld us time went, %ld bytes can send\n",
+        //         t_now - conn_io->t_last, conn_io->can_send);
+        conn_io->t_last = t_now;
+        if (conn_io->can_send < 1350)
+        {
+            // fprintf(stderr, "can_send < 1350\n");
+            conn_io->pace_timer.repeat = 0.001;
+            ev_timer_again(loop, &conn_io->pace_timer);
+            break;
+        }
+        // fprintf(stderr, "send?\n");
+        // ssize_t written = quiche_conn_send(conn_io->conn, out, sizeof(out));
+        // wzx change: use new api
         ssize_t written = quiche_conn_send(conn_io->conn, out, sizeof(out),
                                            &send_info);
-
-        if (written == QUICHE_ERR_DONE) {
-            fprintf(stderr, "done writing\n");
+        if (written == QUICHE_ERR_DONE)
+        {
+            // fprintf(stderr, "done writing\n");
+            conn_io->pace_timer.repeat = 99999.0;
+            ev_timer_again(loop, &conn_io->pace_timer);
+            conn_io->done_writing = true; // app_limited
             break;
         }
 
-        if (written < 0) {
-            fprintf(stderr, "failed to create packet: %zd\n", written);
+        if (written < 0)
+        {
+            // fprintf(stderr, "failed to create packet: %zd\n", written);
             return;
         }
-
         ssize_t sent = sendto(conn_io->sock, out, written, 0,
-                              (struct sockaddr *) &send_info.to,
-                              send_info.to_len);
-
-        if (sent != written) {
+                              (struct sockaddr *)&send_info.to, send_info.to_len);
+        // ssize_t sent = send(conn_io->sock, out, written, 0);
+        if (sent != written)
+        {
             perror("failed to send");
             return;
         }
 
-        fprintf(stderr, "sent %zd bytes\n", sent);
+        // fprintf(stderr, "sent %zd bytes\n", sent);
+        conn_io->can_send -= sent;
     }
-
     double t = quiche_conn_timeout_as_nanos(conn_io->conn) / 1e9f;
     conn_io->timer.repeat = t;
+    // fprintf(stderr, "timeout t = %lf\n", t);
     ev_timer_again(loop, &conn_io->timer);
 }
 
-static void recv_cb(EV_P_ ev_io *w, int revents) {
-    static bool req_sent = false;
+static void flush_egress_pace(EV_P_ ev_timer *pace_timer, int revents)
+{
+    struct conn_io *conn_io = pace_timer->data;
+    // fprintf(stderr, "begin flush_egress_pace\n");
+    flush_egress(loop, conn_io);
+}
 
+static void recv_cb(EV_P_ ev_io *w, int revents)
+{
     struct conn_io *conn_io = w->data;
+    static uint8_t buf[MAX_BLOCK_SIZE];
+    uint8_t i = 3;
 
-    static uint8_t buf[65535];
-
-    while (1) {
+    while (i--)
+    {
+        // ssize_t read = recv(conn_io->sock, buf, sizeof(buf), 0);
+        // wzx change: use recvfrom to get peer address
         struct sockaddr_storage peer_addr;
         socklen_t peer_addr_len = sizeof(peer_addr);
         memset(&peer_addr, 0, peer_addr_len);
 
         ssize_t read = recvfrom(conn_io->sock, buf, sizeof(buf), 0,
-                                (struct sockaddr *) &peer_addr,
+                                (struct sockaddr *)&peer_addr,
                                 &peer_addr_len);
-
-        if (read < 0) {
-            if ((errno == EWOULDBLOCK) || (errno == EAGAIN)) {
-                fprintf(stderr, "recv would block\n");
+        if (read < 0)
+        {
+            if ((errno == EWOULDBLOCK) || (errno == EAGAIN))
+            {
+                // fprintf(stderr, "recv would block\n");
                 break;
             }
 
-            perror("failed to read");
+            perror("client failed to read");
             return;
         }
-
+        total_bytes += read;
+        // wzx add: recv info
         quiche_recv_info recv_info = {
-            (struct sockaddr *) &peer_addr,
+            (struct sockaddr *)&peer_addr,
             peer_addr_len,
 
-            (struct sockaddr *) &conn_io->local_addr,
+            (struct sockaddr *)&conn_io->local_addr,
             conn_io->local_addr_len,
         };
 
         ssize_t done = quiche_conn_recv(conn_io->conn, buf, read, &recv_info);
+        // ssize_t done = quiche_conn_recv(conn_io->conn, buf, read);
 
-        if (done < 0) {
-            fprintf(stderr, "failed to process packet\n");
-            continue;
+        if (done == QUICHE_ERR_DONE)
+        {
+            // fprintf(stderr, "done reading\n");
+            break;
         }
 
-        fprintf(stderr, "recv %zd bytes\n", done);
+        if (done < 0)
+        {
+            // fprintf(stderr, "failed to process packet\n");
+            return;
+        }
+
+        // fprintf(stderr, "recv %zd bytes\n", done);
     }
 
-    fprintf(stderr, "done reading\n");
+    if (quiche_conn_is_closed(conn_io->conn))
+    {
+        // fprintf(stderr, "connection closed\n");
+        quiche_stats stats;
+        quiche_conn_stats(conn_io->conn, &stats);
 
-    if (quiche_conn_is_closed(conn_io->conn)) {
-        fprintf(stderr, "connection closed\n");
+        quiche_path_stats path_stats;
+        // wzx : template use idx = 0,maybe need to change
+        quiche_conn_path_stats(conn_io->conn, 0, &path_stats);
+        if (end_timestamp == 0)
+        {
+            end_timestamp = getCurrentUsec();
+        }
+        WRITE_TO_LOG("connection closed, recv=%zu sent=%zu lost=%zu rtt=%fms cwnd=%zu, total_bytes=%zu, complete_bytes=%zu, good_bytes=%zu, total_time=%zu\n",
+                     stats.recv, stats.sent, stats.lost, path_stats.rtt / 1000.0 / 1000.0, path_stats.cwnd,
+                     total_bytes, complete_bytes, good_bytes, end_timestamp - start_timestamp
 
+        );
         ev_break(EV_A_ EVBREAK_ONE);
         return;
     }
 
-    if (quiche_conn_is_established(conn_io->conn) && !req_sent) {
-        const uint8_t *app_proto;
-        size_t app_proto_len;
-
-        quiche_conn_application_proto(conn_io->conn, &app_proto, &app_proto_len);
-
-        fprintf(stderr, "connection established: %.*s\n",
-                (int) app_proto_len, app_proto);
-
-        const static uint8_t r[] = "GET /index.html\r\n";
-        if (quiche_conn_stream_send(conn_io->conn, 4, r, sizeof(r), true) < 0) {
-            fprintf(stderr, "failed to send HTTP request\n");
-            return;
-        }
-
-        fprintf(stderr, "sent HTTP request\n");
-
-        req_sent = true;
-    }
-
-    if (quiche_conn_is_established(conn_io->conn)) {
+    if (quiche_conn_is_established(conn_io->conn))
+    {
         uint64_t s = 0;
 
         quiche_stream_iter *readable = quiche_conn_readable(conn_io->conn);
 
-        while (quiche_stream_iter_next(readable, &s)) {
-            fprintf(stderr, "stream %" PRIu64 " is readable\n", s);
+        while (quiche_stream_iter_next(readable, &s))
+        {
+            // fprintf(stderr, "stream %" PRIu64 " is readable\n", s);
 
             bool fin = false;
-            ssize_t recv_len = quiche_conn_stream_recv(conn_io->conn, s,
-                                                       buf, sizeof(buf),
-                                                       &fin);
-            if (recv_len < 0) {
+            ssize_t recv_len = quiche_conn_stream_recv(conn_io->conn, s, buf,
+                                                       sizeof(buf), &fin);
+            /* total_bytes += recv_len; */
+            if (recv_len < 0)
+            {
                 break;
             }
+            if (fin)
+            {
+                if (s == 1)
+                {
+                    // cfgs length
+                    cfgs_len = *((int *)buf);
+                    fprintf(stderr, "get cfgs number: %d\n", cfgs_len);
+                    cfgs_len--;
+                }
+                else
+                {
+                    // output block_size,block_priority,block_deadline
+                    uint64_t block_size, block_priority, block_deadline;
+                    quiche_block block_info;
+                    quiche_conn_block_info(conn_io->conn, s, &block_info);
+                    block_size = block_info.size;
+                    block_priority = block_info.priority;
+                    block_deadline = block_info.deadline;
+                    // int64_t bct = quiche_conn_get_bct(conn_io->conn, s);
+                    int64_t bct = quiche_conn_bct(conn_io->conn, s);
+                    uint64_t goodbytes =
+                        quiche_conn_get_good_recv(conn_io->conn, s);
+                    // quiche_conn_get_block_info(conn_io->conn, s, &block_size,
+                    //                            &block_priority, &block_deadline);
+                    good_bytes += goodbytes;
+                    complete_bytes += block_size;
+                    // FILE* clientlog = fopen("client.log", "a+");
+                    // fprintf(clientlog, "%2ld %14ld %4ld %9ld %5ld %9ld\n", s,
+                    //         goodbytes, bct, block_size, block_priority,
+                    //         block_deadline);
+                    // fclose(clientlog);
+                    WRITE_TO_LOG("%2ld %10ld %10ld %10ld %10ld\n",
+                                 s, bct, block_size, block_priority, block_deadline);
 
-            printf("%.*s", (int) recv_len, buf);
-
-            if (fin) {
-                if (quiche_conn_close(conn_io->conn, true, 0, NULL, 0) < 0) {
-                    fprintf(stderr, "failed to close connection\n");
+                    WRITE_TO_CSV("%2ld,%10ld,%10ld,%10ld,%10ld\n", s, bct,
+                                 block_size, block_priority, block_deadline);
+                    if (--cfgs_len == 0)
+                    {
+                        end_timestamp = getCurrentUsec();
+                        fprintf(stderr, "end_timestamp: %lu\n", end_timestamp);
+                    }
                 }
             }
+
+            // if (fin) {
+            //     if (quiche_conn_close(conn_io->conn, true, 0, NULL, 0) < 0) {
+            //         fprintf(stderr, "failed to close connection\n");
+            //     }
+            // }
         }
 
         quiche_stream_iter_free(readable);
@@ -201,100 +321,158 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
     flush_egress(loop, conn_io);
 }
 
-static void timeout_cb(EV_P_ ev_timer *w, int revents) {
+static void timeout_cb(EV_P_ ev_timer *w, int revents)
+{
     struct conn_io *conn_io = w->data;
     quiche_conn_on_timeout(conn_io->conn);
 
-    fprintf(stderr, "timeout\n");
+    // fprintf(stderr, "timeout\n");
 
     flush_egress(loop, conn_io);
 
-    if (quiche_conn_is_closed(conn_io->conn)) {
+    if (quiche_conn_is_closed(conn_io->conn))
+    {
+        // fprintf(stderr, "connection closed in timeout \n");
+        /* end_timestamp = getCurrentUsec(); */
         quiche_stats stats;
-        quiche_path_stats path_stats;
-
         quiche_conn_stats(conn_io->conn, &stats);
+        quiche_path_stats path_stats;
+        // wzx : template use idx = 0,maybe need to change
         quiche_conn_path_stats(conn_io->conn, 0, &path_stats);
 
-        fprintf(stderr, "connection closed, recv=%zu sent=%zu lost=%zu rtt=%" PRIu64 "ns\n",
-                stats.recv, stats.sent, stats.lost, path_stats.rtt);
+        // FILE* clientlog = fopen("client.log", "a+");
+        // fprintf(clientlog, "connection closed, recv=%zu sent=%zu lost=%zu rtt=%" PRIu64 "ns cwnd=%zu, total_bytes=%zu, complete_bytes=%zu, good_bytes=%zu, total_time=%zu\n",
+        //         stats.recv, stats.sent, stats.lost, stats.rtt, stats.cwnd,
+        //         total_bytes, complete_bytes, good_bytes, total_time
+        //         );
+        // fclose(clientlog);
+        if (end_timestamp == 0)
+        {
+            end_timestamp = getCurrentUsec();
+        }
+        WRITE_TO_LOG("connection closed\nrecv,sent,lost,rtt(ms),cwnd,total_bytes,complete_bytes,good_bytes,total_time(us)\n%zu,%zu,%zu,%f,%zu,%zu,%zu,%zu,%zu\n",
+                     stats.recv, stats.sent, stats.lost, path_stats.rtt / 1000.0 / 1000.0, path_stats.cwnd,
+                     total_bytes, complete_bytes, good_bytes, end_timestamp - start_timestamp);
+        // fprintf(stderr,
+        //         "connection closed, recv=%zu sent=%zu lost=%zu rtt=%" PRIu64
+        //         "ns\n",
+        //         stats.recv, stats.sent, stats.lost, stats.rtt);
 
         ev_break(EV_A_ EVBREAK_ONE);
+
+        fflush(stdout);
         return;
     }
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
     const char *host = argv[1];
     const char *port = argv[2];
+    // const double priority_weight = atof(argv[4]);
+    // const uint64_t min_priority = atoi(argv[5]);
+    CLIENT_LOG = fopen(CLIENT_LOG_FILENAME, "w");
+    CLIENT_CSV = fopen(CLIENT_CSV_FILENAME, "w");
 
-    const struct addrinfo hints = {
-        .ai_family = PF_UNSPEC,
-        .ai_socktype = SOCK_DGRAM,
-        .ai_protocol = IPPROTO_UDP
-    };
+    if (CLIENT_LOG == NULL)
+    {
+        perror("file open failed: log");
+        return -1;
+    }
 
-    quiche_enable_debug_logging(debug_log, NULL);
+    if (CLIENT_CSV == NULL)
+    {
+        perror("file open failed: csv");
+        return -1;
+    }
+
+    const struct addrinfo hints = {.ai_family = PF_UNSPEC,
+                                   .ai_socktype = SOCK_DGRAM,
+                                   .ai_protocol = IPPROTO_UDP};
+
+    // quiche_enable_debug_logging(debug_log, NULL);
 
     struct addrinfo *peer;
-    if (getaddrinfo(host, port, &hints, &peer) != 0) {
+    if (getaddrinfo(host, port, &hints, &peer) != 0)
+    {
         perror("failed to resolve host");
         return -1;
     }
 
+    WRITE_TO_LOG("peer_addr = %s:%s\n", host, port);
+
     int sock = socket(peer->ai_family, SOCK_DGRAM, 0);
-    if (sock < 0) {
+    if (sock < 0)
+    {
         perror("failed to create socket");
         return -1;
     }
 
-    if (fcntl(sock, F_SETFL, O_NONBLOCK) != 0) {
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) != 0)
+    {
         perror("failed to make socket non-blocking");
         return -1;
     }
 
+    // if (connect(sock, peer->ai_addr, peer->ai_addrlen) < 0)
+    // {
+    //     perror("failed to connect socket");
+    //     return -1;
+    // }
+
     quiche_config *config = quiche_config_new(0xbabababa);
-    if (config == NULL) {
+    if (config == NULL)
+    {
         fprintf(stderr, "failed to create config\n");
         return -1;
     }
-
-    quiche_config_set_application_protos(config,
-        (uint8_t *) "\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9", 38);
+    // wzx change: change protos
+    quiche_config_set_application_protos(
+        config,
+        (uint8_t *)"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9", 38);
 
     quiche_config_set_max_idle_timeout(config, 5000);
+    // wzx change: change max udp payload size ,commneted by wzx
+    //  quiche_config_set_max_packet_size(config, MAX_DATAGRAM_SIZE);
     quiche_config_set_max_recv_udp_payload_size(config, MAX_DATAGRAM_SIZE);
     quiche_config_set_max_send_udp_payload_size(config, MAX_DATAGRAM_SIZE);
-    quiche_config_set_initial_max_data(config, 10000000);
-    quiche_config_set_initial_max_stream_data_bidi_local(config, 1000000);
-    quiche_config_set_initial_max_stream_data_uni(config, 1000000);
-    quiche_config_set_initial_max_streams_bidi(config, 100);
-    quiche_config_set_initial_max_streams_uni(config, 100);
-    quiche_config_set_disable_active_migration(config, true);
 
-    if (getenv("SSLKEYLOGFILE")) {
-      quiche_config_log_keys(config);
+    quiche_config_set_initial_max_data(config, 10000000000);
+    quiche_config_set_initial_max_stream_data_bidi_local(config, 1000000000);
+    quiche_config_set_initial_max_stream_data_bidi_remote(config, 1000000000);
+    // quiche_config_set_initial_max_stream_data_uni(config, 1000000000);
+    quiche_config_set_initial_max_streams_bidi(config, 10000);
+    // quiche_config_set_initial_max_streams_uni(config, 10000);
+    // quiche_config_set_disable_active_migration(config, true);
+    quiche_config_set_cc_algorithm(config, QUICHE_CC_RENO);
+
+    if (getenv("SSLKEYLOGFILE"))
+    {
+        quiche_config_log_keys(config);
     }
 
     uint8_t scid[LOCAL_CONN_ID_LEN];
     int rng = open("/dev/urandom", O_RDONLY);
-    if (rng < 0) {
+    if (rng < 0)
+    {
         perror("failed to open /dev/urandom");
         return -1;
     }
 
     ssize_t rand_len = read(rng, &scid, sizeof(scid));
-    if (rand_len < 0) {
+    if (rand_len < 0)
+    {
         perror("failed to create connection ID");
         return -1;
     }
 
     struct conn_io *conn_io = malloc(sizeof(*conn_io));
-    if (conn_io == NULL) {
+    if (conn_io == NULL)
+    {
         fprintf(stderr, "failed to allocate connection IO\n");
         return -1;
     }
-
+    // wzx add: get local address
     conn_io->local_addr_len = sizeof(conn_io->local_addr);
     if (getsockname(sock, (struct sockaddr *)&conn_io->local_addr,
                     &conn_io->local_addr_len) != 0)
@@ -303,18 +481,35 @@ int main(int argc, char *argv[]) {
         return -1;
     };
 
-    quiche_conn *conn = quiche_connect(host, (const uint8_t *) scid, sizeof(scid),
-                                       (struct sockaddr *) &conn_io->local_addr,
+    // quiche_conn *conn =
+    //     quiche_connect(host, (const uint8_t *)scid, sizeof(scid), config);
+    // wzx change
+    quiche_conn *conn = quiche_connect(host, (const uint8_t *)scid, sizeof(scid),
+                                       (struct sockaddr *)&conn_io->local_addr,
                                        conn_io->local_addr_len,
                                        peer->ai_addr, peer->ai_addrlen, config);
+    start_timestamp = getCurrentUsec();
 
-    if (conn == NULL) {
+    if (conn == NULL)
+    {
         fprintf(stderr, "failed to create connection\n");
         return -1;
     }
 
+    // fprintf(stdout, "StreamID goodbytes bct BlockSize Priority Deadline\n");
+
+    WRITE_TO_LOG("test begin!\n\n");
+    WRITE_TO_LOG("BlockID  bct  BlockSize  Priority  Deadline\n");
+    WRITE_TO_CSV("BlockID,bct,BlockSize,Priority,Deadline\n");
+    // FILE* clientlog = fopen("client.log", "w");
+    // fprintf(clientlog, "StreamID  bct  BlockSize  Priority  Deadline\n");
+    // fclose(clientlog);
+
     conn_io->sock = sock;
     conn_io->conn = conn;
+    conn_io->t_last = getCurrentUsec();
+    conn_io->can_send = 1350;
+    conn_io->done_writing = false;
 
     ev_io watcher;
 
@@ -327,6 +522,11 @@ int main(int argc, char *argv[]) {
     ev_init(&conn_io->timer, timeout_cb);
     conn_io->timer.data = conn_io;
 
+    // ev_timer_init(&conn_io->pace_timer, flush_egress_pace, 99999.0, 99999.0);
+    // ev_timer_start(loop, &conn_io->pace_timer);
+    ev_init(&conn_io->pace_timer, flush_egress_pace);
+    conn_io->pace_timer.data = conn_io;
+
     flush_egress(loop, conn_io);
 
     ev_loop(loop, 0);
@@ -336,6 +536,8 @@ int main(int argc, char *argv[]) {
     quiche_conn_free(conn);
 
     quiche_config_free(config);
+
+    close(sock);
 
     return 0;
 }
